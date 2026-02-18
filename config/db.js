@@ -10,4 +10,9 @@ async function connectDb() {
   await mongoose.connect(mongoUri);
 }
 
-module.exports = { connectDb };
+async function disconnectDb() {
+  if (mongoose.connection.readyState === 0) return;
+  await mongoose.disconnect();
+}
+
+module.exports = { connectDb, disconnectDb };

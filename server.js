@@ -4,7 +4,7 @@ const cookieParser = require("cookie-parser");
 const dotenv = require("dotenv");
 const helmet = require("helmet");
 
-const { connectDb } = require("./config/db");
+const { connectDb, disconnectDb } = require("./config/db");
 const authRoutes = require("./routes/auth.routes");
 const notesRoutes = require("./routes/notes.routes");
 
@@ -48,9 +48,28 @@ app.use((err, req, res, next) => {
 async function start() {
   await connectDb();
   const port = process.env.PORT ? Number(process.env.PORT) : 5050;
-  app.listen(port, () => {
+  const server = app.listen(port, () => {
     console.log(`API listening on port ${port}`);
   });
+
+  async function shutdown() {
+    await new Promise((resolve) => server.close(resolve));
+    await disconnectDb();
+  }
+
+  const handleSignal = (signal) => {
+    shutdown()
+      .then(() => {
+        process.exit(0);
+      })
+      .catch((err) => {
+        console.error(err);
+        process.exit(1);
+      });
+  };
+
+  process.on("SIGINT", handleSignal);
+  process.on("SIGTERM", handleSignal);
 }
 
 start().catch((err) => {
