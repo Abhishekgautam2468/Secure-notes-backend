@@ -1,6 +1,9 @@
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
+const mongoose = require("mongoose");
 const User = require("../models/User");
+const Note = require("../models/Note");
+const Tag = require("../models/Tag");
 const { createAccessToken, createRefreshToken, verifyRefreshToken, sha256Hex } = require("../utils/tokens");
 const { isValidEmail, validatePasswordStrength } = require("../utils/validation");
 
@@ -222,6 +225,65 @@ async function me(req, res) {
   return res.json({ user: { id: user._id.toString(), name: user.name, email: user.email } });
 }
 
+async function updateProfile(req, res) {
+  const name = String(req.body?.name || "").trim();
+  const errors = {};
+  if (!name || name.length < 3) errors.name = "Name must be at least 3 characters";
+  if (name.length > 80) errors.name = "Name must be at most 80 characters";
+  if (Object.keys(errors).length) return sendValidation(res, errors);
+
+  const user = await User.findByIdAndUpdate(req.user.id, { name }, { new: true }).lean();
+  if (!user) return res.status(404).json({ message: "User not found" });
+  return res.json({ user: { id: user._id.toString(), name: user.name, email: user.email } });
+}
+
+async function changePassword(req, res) {
+  const oldPassword = String(req.body?.oldPassword || "");
+  const newPassword = String(req.body?.password || req.body?.newPassword || "");
+  const confirmPassword = String(req.body?.confirmPassword || "");
+
+  const errors = {};
+  if (!oldPassword) errors.oldPassword = "Old password is required";
+  const pw = validatePasswordStrength(newPassword);
+  if (!pw.ok) errors.password = pw.message;
+  if (confirmPassword && confirmPassword !== newPassword) errors.confirmPassword = "Passwords do not match";
+  if (Object.keys(errors).length) return sendValidation(res, errors);
+
+  const user = await User.findById(req.user.id);
+  if (!user) return res.status(404).json({ message: "User not found" });
+
+  const ok = await bcrypt.compare(oldPassword, user.passwordHash);
+  if (!ok) return res.status(401).json({ message: "Old password is incorrect" });
+
+  user.passwordHash = await bcrypt.hash(newPassword, 12);
+  user.refreshTokenHash = null;
+  user.refreshTokenExpiresAt = null;
+  await user.save();
+
+  res.clearCookie("refreshToken", refreshCookieOptions());
+  return res.json({ message: "Password updated successfully" });
+}
+
+async function deleteAccount(req, res) {
+  const password = String(req.body?.password || "");
+  if (!password) return sendValidation(res, { password: "Password is required" });
+
+  const userId = new mongoose.Types.ObjectId(req.user.id);
+  const user = await User.findById(userId);
+  if (!user) return res.status(404).json({ message: "User not found" });
+
+  const ok = await bcrypt.compare(password, user.passwordHash);
+  if (!ok) return res.status(401).json({ message: "Password is incorrect" });
+
+  await Note.deleteMany({ userId });
+  await Tag.deleteMany({ userId });
+  const deleted = await User.deleteOne({ _id: userId });
+
+  res.clearCookie("refreshToken", refreshCookieOptions());
+  if (!deleted?.deletedCount) return res.status(404).json({ message: "User not found" });
+  return res.json({ ok: true });
+}
+
 module.exports = {
   register,
   login,
@@ -229,5 +291,8 @@ module.exports = {
   logout,
   forgotPassword,
   resetPassword,
-  me
+  me,
+  updateProfile,
+  changePassword,
+  deleteAccount
 };
