@@ -7,6 +7,8 @@ const helmet = require("helmet");
 const { connectDb, disconnectDb } = require("./config/db");
 const authRoutes = require("./routes/auth.routes");
 const notesRoutes = require("./routes/notes.routes");
+const usersRoutes = require("./routes/users.routes");
+const notificationsRoutes = require("./routes/notifications.routes");
 
 dotenv.config();
 
@@ -35,6 +37,8 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/notes", notesRoutes);
+app.use("/api/users", usersRoutes);
+app.use("/api/notifications", notificationsRoutes);
 
 app.use((err, req, res, next) => {
   const status = err?.statusCode || 500;

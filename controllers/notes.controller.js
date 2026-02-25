@@ -1,6 +1,8 @@
 const mongoose = require("mongoose");
 const Note = require("../models/Note");
 const Tag = require("../models/Tag");
+const User = require("../models/User");
+const Notification = require("../models/Notification");
 
 const RESERVED_CREATE_TAG_KEYS = new Set(["all", "personal", "projects", "business"]);
 const NON_DELETABLE_TAG_KEYS = new Set(["all"]);
@@ -47,6 +49,75 @@ function defaultLabelFor(key) {
   return String(key || "");
 }
 
+function normalizeObjectIdString(value) {
+  if (!value) return null;
+  try {
+    return String(value);
+  } catch {
+    return null;
+  }
+}
+
+function getRole(note, userId) {
+  const uid = normalizeObjectIdString(userId);
+  if (!uid || !note) return null;
+
+  const ownerId = normalizeObjectIdString(note.userId);
+  if (ownerId && ownerId === uid) return "owner";
+
+  const shared = Array.isArray(note.sharedWith) ? note.sharedWith : [];
+  for (const s of shared) {
+    const sharedUserId = normalizeObjectIdString(s?.userId);
+    if (!sharedUserId || sharedUserId !== uid) continue;
+    const perm = String(s?.permission || "").toLowerCase();
+    if (perm === "editor") return "editor";
+    if (perm === "viewer") return "viewer";
+  }
+
+  return null;
+}
+
+function canView(note, userId) {
+  const role = getRole(note, userId);
+  return role === "owner" || role === "editor" || role === "viewer";
+}
+
+function canEdit(note, userId) {
+  const role = getRole(note, userId);
+  return role === "owner" || role === "editor";
+}
+
+function canDelete(note, userId) {
+  return getRole(note, userId) === "owner";
+}
+
+function pushActivity(note, { action, userId, meta }) {
+  if (!note) return;
+  const entry = {
+    action: String(action || "").trim(),
+    userId: new mongoose.Types.ObjectId(userId),
+    timestamp: new Date(),
+    meta: meta ?? null,
+  };
+  note.activityLog = Array.isArray(note.activityLog) ? note.activityLog : [];
+  note.activityLog.push(entry);
+}
+
+async function createNotification({ recipientUserId, actorUserId, noteId, type, permission }) {
+  try {
+    await Notification.create({
+      recipientUserId: new mongoose.Types.ObjectId(recipientUserId),
+      actorUserId: new mongoose.Types.ObjectId(actorUserId),
+      noteId: new mongoose.Types.ObjectId(noteId),
+      type,
+      permission: permission || null,
+      readAt: null,
+    });
+  } catch (err) {
+    console.error("Failed to create notification:", err);
+  }
+}
+
 async function listNotes(req, res) {
   const filter = { userId: req.user.id };
 
@@ -68,7 +139,8 @@ async function listNotes(req, res) {
   }
 
   const notes = await Note.find(filter).sort({ updatedAt: -1 }).lean();
-  return res.json({ notes });
+  const shaped = notes.map((n) => shapeNoteForUser(n, req.user.id));
+  return res.json({ notes: shaped });
 }
 
 async function createNote(req, res) {
@@ -81,9 +153,19 @@ async function createNote(req, res) {
     title,
     body,
     category: normalizedCategory,
+    lastEditedBy: req.user.id,
+    lastEditedAt: new Date(),
+    activityLog: [
+      {
+        action: "created",
+        userId: req.user.id,
+        timestamp: new Date(),
+        meta: null,
+      },
+    ],
   });
 
-  return res.status(201).json({ note });
+  return res.status(201).json({ note: shapeNoteForUser(note, req.user.id) });
 }
 
 async function updateNote(req, res) {
@@ -101,10 +183,52 @@ async function updateNote(req, res) {
     update.category = normalizedCategory;
   }
 
-  const note = await Note.findOneAndUpdate({ _id: id, userId: req.user.id }, update, { new: true }).lean();
+  const note = await Note.findById(id);
   if (!note) return res.status(404).json({ message: "Note not found" });
+  if (!canView(note, req.user.id)) {
+    return res.status(404).json({ message: "Note not found" });}
 
-  return res.json({ note });
+  const role = getRole(note, req.user.id);
+  if (update.category != null && role !== "owner") {
+    return res.status(403).json({ message: "Only the owner can change category" });
+  }
+
+  const isEditingContent = typeof update.title === "string" || typeof update.body === "string";
+  if (isEditingContent && !canEdit(note, req.user.id)) {
+    return res.status(403).json({ message: "You do not have permission to edit this note" });
+  }
+
+  const titleChanged = typeof update.title === "string" && update.title !== note.title;
+  const bodyChanged = typeof update.body === "string" && update.body !== note.body;
+
+  if (typeof update.title === "string") {
+    note.title = update.title;
+  }
+  if (typeof update.body === "string") {
+    note.body = update.body;
+  }
+  if (update.category != null) {
+    note.category = update.category;
+  }
+
+  if (titleChanged || bodyChanged) {
+    note.lastEditedBy = req.user.id;
+    note.lastEditedAt = new Date();
+    pushActivity(note, {
+      action: "edited",
+      userId: req.user.id,
+      meta: {
+        fields: [
+          titleChanged ? "title" : null, 
+          bodyChanged ? "body" : null
+        ].filter(Boolean),
+      },
+    });
+  }
+
+  await note.save();
+
+  return res.json({ note: shapeNoteForUser(note, req.user.id) });
 }
 
 async function setArchived(req, res) {
@@ -114,13 +238,16 @@ async function setArchived(req, res) {
   const archived = parseBoolean(req.body?.archived);
   if (archived == null) return res.status(400).json({ message: "archived is required" });
 
-  const update = { isArchived: archived };
-  if (archived) update.isTrashed = false;
-
-  const note = await Note.findOneAndUpdate({ _id: id, userId: req.user.id }, update, { new: true }).lean();
+  const note = await Note.findById(id);
   if (!note) return res.status(404).json({ message: "Note not found" });
+  if (!canView(note, req.user.id)) return res.status(404).json({ message: "Note not found" });
+  if (!canDelete(note, req.user.id)) return res.status(403).json({ message: "Only the owner can archive notes" });
 
-  return res.json({ note });
+  note.isArchived = archived;
+  if (archived) note.isTrashed = false;
+  await note.save();
+
+  return res.json({ note: shapeNoteForUser(note, req.user.id) });
 }
 
 async function setTrashed(req, res) {
@@ -130,21 +257,26 @@ async function setTrashed(req, res) {
   const trashed = parseBoolean(req.body?.trashed);
   if (trashed == null) return res.status(400).json({ message: "trashed is required" });
 
-  const update = { isTrashed: trashed };
-  if (trashed) update.isArchived = false;
-
-  const note = await Note.findOneAndUpdate({ _id: id, userId: req.user.id }, update, { new: true }).lean();
+  const note = await Note.findById(id);
   if (!note) return res.status(404).json({ message: "Note not found" });
+  if (!canView(note, req.user.id)) return res.status(404).json({ message: "Note not found" });
+  if (!canDelete(note, req.user.id)) return res.status(403).json({ message: "Only the owner can trash notes" });
 
-  return res.json({ note });
+  note.isTrashed = trashed;
+  if (trashed) note.isArchived = false;
+  await note.save();
+
+  return res.json({ note: shapeNoteForUser(note, req.user.id) });
 }
 
 async function deleteNote(req, res) {
   const id = req.params.id;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid note id" });
 
-  const note = await Note.findOne({ _id: id, userId: req.user.id }).lean();
+  const note = await Note.findById(id).lean();
   if (!note) return res.status(404).json({ message: "Note not found" });
+  if (!canView(note, req.user.id)) return res.status(404).json({ message: "Note not found" });
+  if (!canDelete(note, req.user.id)) return res.status(403).json({ message: "Only the owner can delete notes" });
   if (!note.isTrashed) return res.status(400).json({ message: "Only trashed notes can be deleted" });
 
   await Note.deleteOne({ _id: id, userId: req.user.id });
@@ -225,6 +357,170 @@ async function deleteTag(req, res) {
   return res.json({ ok: true, deletedNotes: notesDeleteRes?.deletedCount || 0 });
 }
 
+function normalizeEmailForLookup(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function validatePermission(input) {
+  const p = String(input || "").toLowerCase();
+  if (p === "viewer" || p === "editor") return p;
+  return null;
+}
+
+function shapeNoteForUser(noteDoc, userId) {
+  if (!noteDoc) return null;
+  const obj = typeof noteDoc.toObject === "function" ? noteDoc.toObject() : { ...noteDoc };
+  const role = getRole(obj, userId);
+  const isShared = Array.isArray(obj.sharedWith) && obj.sharedWith.length > 0;
+  const shaped = { ...obj, access: { role: role || null }, isShared: Boolean(isShared) };
+  if (role !== "owner") {
+    delete shaped.sharedWith;
+  }
+  return shaped;
+}
+
+async function shareNote(req, res) {
+  const id = req.params.id;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid note id" });
+
+  const email = normalizeEmailForLookup(req.body?.email);
+  const permission = validatePermission(req.body?.permission);
+  if (!email) return res.status(400).json({ message: "Valid email is required" });
+  if (!permission) return res.status(400).json({ message: "permission must be 'viewer' or 'editor'" });
+
+  const note = await Note.findById(id);
+  if (!note) return res.status(404).json({ message: "Note not found" });
+  if (!canDelete(note, req.user.id)) return res.status(403).json({ message: "Only the owner can share notes" });
+
+  const user = await User.findOne({ email }).lean();
+  if (!user) return res.status(404).json({ message: "User not found" });
+
+  const ownerId = String(note.userId);
+  const targetId = String(user._id);
+  if (ownerId === targetId) return res.status(400).json({ message: "Cannot share a note with yourself" });
+
+  note.sharedWith = Array.isArray(note.sharedWith) ? note.sharedWith : [];
+  const existing = note.sharedWith.find((s) => String(s.userId) === targetId);
+  if (existing) {
+    if (existing.permission === permission) {
+      return res.json({ note: shapeNoteForUser(note, req.user.id) });
+    }
+    existing.permission = permission;
+    pushActivity(note, {
+      action: "permission_changed",
+      userId: req.user.id,
+      meta: { targetUserId: targetId, permission }
+    });
+    await createNotification({
+      recipientUserId: targetId,
+      actorUserId: req.user.id,
+      noteId: id,
+      type: "permission_changed",
+      permission,
+    });
+  } else {
+    note.sharedWith.push({
+      userId: new mongoose.Types.ObjectId(targetId),
+      permission
+    });
+    pushActivity(note, {
+      action: "shared",
+      userId: req.user.id,
+      meta: { targetUserId: targetId, permission }
+    });
+    await createNotification({
+      recipientUserId: targetId,
+      actorUserId: req.user.id,
+      noteId: id,
+      type: "shared",
+      permission,
+    });
+  }
+
+  await note.save();
+  return res.json({ note: shapeNoteForUser(note, req.user.id) });
+}
+
+async function updateSharePermission(req, res) {
+  const id = req.params.id;
+  const targetUserId = req.params.userId;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid note id" });
+  if (!mongoose.isValidObjectId(targetUserId)) return res.status(400).json({ message: "Invalid user id" });
+
+  const permission = validatePermission(req.body?.permission);
+  if (!permission) return res.status(400).json({ message: "permission must be 'viewer' or 'editor'" });
+
+  const note = await Note.findById(id);
+  if (!note) return res.status(404).json({ message: "Note not found" });
+  if (!canDelete(note, req.user.id)) return res.status(403).json({ message: "Only the owner can change permission" });
+
+  note.sharedWith = Array.isArray(note.sharedWith) ? note.sharedWith : [];
+  const existing = note.sharedWith.find((s) => String(s.userId) === String(targetUserId));
+  if (!existing) return res.status(404).json({ message: "Share not found" });
+  if (existing.permission !== permission) {
+    existing.permission = permission;
+    pushActivity(note, {
+      action: "permission_changed",
+      userId: req.user.id,
+      meta: { targetUserId: String(targetUserId), permission }
+    });
+    await createNotification({
+      recipientUserId: String(targetUserId),
+      actorUserId: req.user.id,
+      noteId: id,
+      type: "permission_changed",
+      permission,
+    });
+  }
+  await note.save();
+  return res.json({ note: shapeNoteForUser(note, req.user.id) });
+}
+
+async function revokeShare(req, res) {
+  const id = req.params.id;
+  const targetUserId = req.params.userId;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid note id" });
+  if (!mongoose.isValidObjectId(targetUserId)) return res.status(400).json({ message: "Invalid user id" });
+
+  const note = await Note.findById(id);
+  if (!note) return res.status(404).json({ message: "Note not found" });
+  if (!canDelete(note, req.user.id)) return res.status(403).json({ message: "Only the owner can revoke access" });
+
+  note.sharedWith = Array.isArray(note.sharedWith) ? note.sharedWith : [];
+  const before = note.sharedWith.length;
+  note.sharedWith = note.sharedWith.filter((s) => String(s.userId) !== String(targetUserId));
+  if (note.sharedWith.length === before) return res.status(404).json({ message: "Share not found" });
+
+  pushActivity(note, {
+    action: "unshared",
+    userId: req.user.id,
+    meta: { targetUserId: String(targetUserId) }
+  });
+  await createNotification({
+    recipientUserId: String(targetUserId),
+    actorUserId: req.user.id,
+    noteId: id,
+    type: "unshared",
+    permission: null,
+  });
+  await note.save();
+  return res.json({ note: shapeNoteForUser(note, req.user.id) });
+}
+
+async function listSharedWithMe(req, res) {
+  const me = new mongoose.Types.ObjectId(req.user.id);
+  const notes = await Note.find({
+    "sharedWith.userId": me,
+    userId: { $ne: me },
+    isTrashed: false,
+    isArchived: false,
+  })
+    .sort({ updatedAt: -1 })
+    .lean();
+  const shaped = notes.map((n) => shapeNoteForUser(n, req.user.id));
+  return res.json({ notes: shaped });
+}
+
 module.exports = {
   listNotes,
   createNote,
@@ -235,4 +531,8 @@ module.exports = {
   listTags,
   createTag,
   deleteTag,
+  shareNote,
+  updateSharePermission,
+  revokeShare,
+  listSharedWithMe,
 };
